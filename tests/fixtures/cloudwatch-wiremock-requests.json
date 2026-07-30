@@ -1,0 +1,56 @@
+{
+  "requests": [
+    {
+      "url": "/",
+      "method": "POST",
+      "headers": {
+        "X-Amz-Target": ["Logs_20140328.PutLogEvents"],
+        "Authorization": ["AWS4-HMAC-SHA256 Credential=dummy/20260720/ap-northeast-1/logs/aws4_request"]
+      },
+      "loggedDate": 1784538002000,
+      "body": {
+        "logGroupName": "/local/myapp/efs/app-front",
+        "logStreamName": "front-local",
+        "logEvents": [
+          {
+            "timestamp": 1784538001000,
+            "message": "2026-07-20T09:00:01Z [app-front] request completed token=dummy-secret"
+          }
+        ]
+      }
+    },
+    {
+      "url": "/",
+      "method": "POST",
+      "headers": {
+        "X-Amz-Target": ["Logs_20140328.PutLogEvents"]
+      },
+      "loggedDate": 1784538000000,
+      "body": {
+        "logGroupName": "/local/myapp/efs/app-back",
+        "logStreamName": "back-local",
+        "logEvents": [
+          {
+            "timestamp": 1784537999000,
+            "message": "2026-07-20T08:59:59Z [app-back] database call completed"
+          }
+        ]
+      }
+    },
+    {
+      "url": "/",
+      "method": "POST",
+      "headers": {
+        "X-Amz-Target": ["Logs_20140328.CreateLogStream"]
+      },
+      "loggedDate": 1784537998000,
+      "body": {
+        "logGroupName": "/local/myapp/efs/app-front",
+        "logStreamName": "front-local"
+      }
+    }
+  ],
+  "meta": {
+    "total": 3
+  }
+}

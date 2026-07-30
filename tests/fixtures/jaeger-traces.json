@@ -1,0 +1,100 @@
+{
+  "data": [
+    {
+      "traceID": "66a00000000000001234567890abcdef",
+      "spans": [
+        {
+          "traceID": "66a00000000000001234567890abcdef",
+          "spanID": "1111111111111111",
+          "operationName": "GET /orders",
+          "references": [],
+          "startTime": 1784538000000000,
+          "duration": 125000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "server"},
+            {"key": "http.request.method", "type": "string", "value": "GET"},
+            {"key": "url.path", "type": "string", "value": "/orders"},
+            {"key": "http.response.status_code", "type": "int64", "value": 200},
+            {"key": "http.request.header.authorization", "type": "string", "value": "Bearer dummy-secret"}
+          ],
+          "logs": [],
+          "processID": "p1"
+        },
+        {
+          "traceID": "66a00000000000001234567890abcdef",
+          "spanID": "2222222222222222",
+          "operationName": "GET http://app-back:8180/orders",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "66a00000000000001234567890abcdef",
+              "spanID": "1111111111111111"
+            }
+          ],
+          "startTime": 1784538000010000,
+          "duration": 95000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "client"},
+            {"key": "server.address", "type": "string", "value": "app-back"},
+            {"key": "http.response.status_code", "type": "int64", "value": 200}
+          ],
+          "logs": [],
+          "processID": "p1"
+        },
+        {
+          "traceID": "66a00000000000001234567890abcdef",
+          "spanID": "3333333333333333",
+          "operationName": "SELECT orders",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "66a00000000000001234567890abcdef",
+              "spanID": "2222222222222222"
+            }
+          ],
+          "startTime": 1784538000030000,
+          "duration": 40000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "client"},
+            {"key": "db.system", "type": "string", "value": "mysql"},
+            {"key": "db.namespace", "type": "string", "value": "appdb"},
+            {"key": "db.statement", "type": "string", "value": "SELECT * FROM orders WHERE token=dummy-secret"}
+          ],
+          "logs": [
+            {
+              "timestamp": 1784538000035000,
+              "fields": [
+                {"key": "event", "type": "string", "value": "query.executed"},
+                {"key": "message", "type": "string", "value": "token=dummy-secret"}
+              ]
+            }
+          ],
+          "processID": "p2"
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "myapp-front",
+          "tags": [
+            {"key": "service.namespace", "type": "string", "value": "myapp"},
+            {"key": "service.version", "type": "string", "value": "local"},
+            {"key": "deployment.environment", "type": "string", "value": "local"}
+          ]
+        },
+        "p2": {
+          "serviceName": "myapp-back",
+          "tags": [
+            {"key": "service.namespace", "type": "string", "value": "myapp"},
+            {"key": "service.version", "type": "string", "value": "local"},
+            {"key": "deployment.environment", "type": "string", "value": "local"}
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 1,
+  "limit": 5,
+  "offset": 0,
+  "errors": null
+}

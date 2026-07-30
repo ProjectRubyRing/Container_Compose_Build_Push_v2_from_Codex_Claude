@@ -1,0 +1,5 @@
+app-1  | 09:18:00,000 INFO  [org.jboss.as.server.deployment] (MSC service thread 1-2) WFLYSRV0027: Starting deployment of "broken.war" (runtime-name: "broken.war")
+app-1  | 09:18:00,100 ERROR [org.jboss.as.connector] (MSC service thread 1-1) WFLYJCA0031: unable to validate and deploy ds or xads
+app-1  | 09:18:00,200 ERROR [org.jboss.as.controller.management-operation] (Controller Boot Thread) WFLYCTL0080: Failed services => {"jboss.deployment.unit.\broken.war\.undertow-deployment" => "Failed to start service"}
+app-1  | 09:18:00,300 ERROR [org.jboss.as.server] (Controller Boot Thread) WFLYSRV0021: Deploy of deployment "broken.war" was rolled back with the following failure message: WFLYCTL0080
+app-1  | 09:18:00,400 ERROR [org.jboss.as] (Controller Boot Thread) WFLYSRV0026: JBoss EAP 8.1.0.GA (WildFly Core 27.1.0.Final-redhat-00010) started (with errors) in 3400ms

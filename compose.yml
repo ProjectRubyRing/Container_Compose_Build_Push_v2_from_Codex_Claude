@@ -1,0 +1,25 @@
+# docker compose build でローカルベースイメージ j1/base.local を生成するための定義。
+#   $ docker compose -f compose.yml build
+# 生成後、build_and_push.sh が j1/base.local を ECR 用にタグ付けしてプッシュする。
+#
+# JBoss のマスターパスワードは environment 型の BuildKit シークレットとして渡す。
+# build_and_push.sh / build_and_verify.sh が環境変数 JBOSS_MASTER_PASSWORD を
+# export してからビルドする (シークレット不使用時は空文字が入る)。
+# スクリプトを使わず手動でビルドする場合は、環境変数を定義してから実行すること:
+#   $ JBOSS_MASTER_PASSWORD=... docker compose -f compose.yml build
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      secrets:
+        - jboss_master_password
+    # ここで指定した名前がローカルベースイメージ名になる（要件: j1/base.local）
+    image: j1/base.local
+
+secrets:
+  # environment 型シークレット: 環境変数 JBOSS_MASTER_PASSWORD の値を、ビルド中
+  # のみ /run/secrets/jboss_master_password として参照できる (RUN --mount=type=secret)。
+  # イメージのレイヤ・履歴・環境変数には残らない。
+  jboss_master_password:
+    environment: JBOSS_MASTER_PASSWORD

@@ -1,0 +1,770 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+if [ -n "${FAKE_DOCKER_CALLS:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_DOCKER_CALLS"
+fi
+
+fail() {
+  printf 'fake docker: unsupported arguments: %s\n' "$*" >&2
+  exit 64
+}
+
+is_cleaned() {
+  [ -n "${FAKE_DOCKER_CLEANED:-}" ] && [ -f "$FAKE_DOCKER_CLEANED" ]
+}
+
+# compose stop (SIGTERM) 済みかどうか。停止後は終了処理のログが増える様子を再現する。
+is_compose_stopped() {
+  [ -n "${FAKE_COMPOSE_SHUTDOWN_MARKER:-}" ] && [ -f "$FAKE_COMPOSE_SHUTDOWN_MARKER" ]
+}
+
+if [ "${1:-}" = "compose" ]; then
+  shift
+  subcommand=""
+  for arg in "$@"; do
+    case "$arg" in
+      version|build|up|logs|ps|down|stop|config)
+        subcommand="$arg"
+        break
+        ;;
+    esac
+  done
+
+  case "$subcommand" in
+    version)
+      printf 'Docker Compose version v2.29.0\n'
+      ;;
+    config)
+      if [[ " $* " == *" --services "* ]]; then
+        # compose.yml の定義順。コンテナを持たないサービスも含む点が ps との違い。
+        for fake_service in ${FAKE_COMPOSE_CONFIG_SERVICES:-${FAKE_COMPOSE_PS_SERVICES:-app}}; do
+          printf '%s\n' "$fake_service"
+        done
+      else
+        fake_secret_id="${FAKE_COMPOSE_CONFIG_SECRET_ID:-jboss_master_password}"
+        printf 'services:\n'
+        printf '  base:\n'
+        printf '    build:\n'
+        printf '      context: /workspace\n'
+        printf '      dockerfile: Dockerfile\n'
+        printf '      secrets:\n'
+        printf '        - source: %s\n' "$fake_secret_id"
+        printf '    image: j1/base.local\n'
+        printf 'secrets:\n'
+        printf '  %s:\n' "$fake_secret_id"
+        printf '    environment: %s\n' "${FAKE_COMPOSE_CONFIG_SECRET_ENV:-JBOSS_MASTER_PASSWORD}"
+      fi
+      ;;
+    build)
+      printf '[fake-build] BUILDKIT_PROGRESS=%s\n' "${BUILDKIT_PROGRESS:-unset}"
+      if [ "${FAKE_DOCKER_BUILD_ECHO_JBOSS_PASSWORD:-false}" = "true" ]; then
+        printf 'fake JBoss CLI input: %s\n' "${JBOSS_MASTER_PASSWORD:-}"
+      fi
+      if [ -n "${FAKE_DOCKER_BUILD_LOG_FILE:-}" ]; then
+        cat "$FAKE_DOCKER_BUILD_LOG_FILE"
+      fi
+      if [ "${FAKE_DOCKER_BUILD_FAIL:-false}" = "true" ]; then
+        printf 'fake compose build failed\n' >&2
+        exit 42
+      fi
+      ;;
+    up)
+      # 依存サービス (adot collector) の healthcheck 失敗で
+      # compose up --wait が失敗する状況の再現。
+      if [ "${FAKE_COMPOSE_UP_FAIL:-false}" = "true" ]; then
+        printf 'dependency failed to start: container adot-collector is unhealthy\n' >&2
+        exit 1
+      fi
+      printf 'fake app container started\n'
+      ;;
+    logs)
+      # ビルド失敗などでコンテナが 1 つも作られていない状態の再現。
+      if [ "${FAKE_COMPOSE_NO_CONTAINERS:-false}" = "true" ]; then
+        exit 0
+      fi
+      if [ -z "${FAKE_COMPOSE_LOG_FILE:-}" ]; then
+        printf 'FAKE_COMPOSE_LOG_FILE is not set\n' >&2
+        exit 65
+      fi
+      last_arg="${!#}"
+      if [ "$last_arg" = "db" ]; then
+        for log_number in $(seq 1 52); do
+          printf 'db-1  | DB%03d: companion service log\n' "$log_number"
+        done
+      elif [ "$last_arg" = "cache" ]; then
+        printf 'cache-1  | CACHE001: cache ready\n'
+        printf 'cache-1  | CACHE002: accepting connections\n'
+      elif [ "$last_arg" = "cwagent" ]; then
+        printf 'cwagent  | I! CloudWatch agent started\n'
+        printf 'cwagent  | I! Log collection configured\n'
+      elif [ "$last_arg" = "adot-collector" ] || [ "$last_arg" = "otel" ]; then
+        printf 'adot-collector  | TracesExporter resource spans: 2, spans: 4\n'
+        # SIGTERM 受信後は ECS と同じく graceful shutdown のログが追記される。
+        if is_compose_stopped; then
+          printf 'adot-collector  | info service@v0.102.0/service.go:255 Received signal from OS {"signal": "terminated"}\n'
+          printf 'adot-collector  | info extensions/extensions.go:60 Stopping extensions...\n'
+          printf 'adot-collector  | info service@v0.102.0/service.go:169 Shutdown complete.\n'
+        fi
+      else
+        cat "$FAKE_COMPOSE_LOG_FILE"
+      fi
+      ;;
+    ps)
+      # ps はコンテナを持つサービスだけを返すため、コンテナ未作成時は何も返さない。
+      if [ "${FAKE_COMPOSE_NO_CONTAINERS:-false}" = "true" ]; then
+        :
+      elif [[ " $* " == *" --services "* ]]; then
+        for fake_service in ${FAKE_COMPOSE_PS_SERVICES:-app}; do
+          printf '%s\n' "$fake_service"
+        done
+      else
+        case "${!#}" in
+          cwagent) printf 'cid-cwagent\n' ;;
+          cloudwatch-logs-mock) printf 'cid-cloudwatch-logs-mock\n' ;;
+          adot-collector|otel) printf 'cid-adot-collector\n' ;;
+          jaeger) printf 'cid-jaeger\n' ;;
+          mysql80) printf 'cid-mysql80\n' ;;
+          aurora84) printf 'cid-mysql84\n' ;;
+          nohealth) printf 'cid-nohealth\n' ;;
+          *) printf 'cid-app\n' ;;
+        esac
+      fi
+      ;;
+    stop)
+      if [ -n "${FAKE_COMPOSE_SHUTDOWN_MARKER:-}" ]; then
+        : > "$FAKE_COMPOSE_SHUTDOWN_MARKER"
+      fi
+      printf 'fake app container stopped\n'
+      ;;
+    down)
+      printf 'fake app container removed\n'
+      ;;
+    *)
+      fail "compose $*"
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "context" ] && [ "${2:-}" = "show" ]; then
+  printf 'default\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "context" ] && [ "${2:-}" = "inspect" ]; then
+  printf 'unix:///var/run/docker.sock\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "create" ]; then
+  printf 'cid-jboss-password-diagnostic\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "cp" ]; then
+  if [ -n "${FAKE_JBOSS_STANDALONE_XML_FILE:-}" ] \
+      && [[ "${2:-}" == *":/opt/eap/standalone/configuration/standalone.xml" ]]; then
+    cp -- "$FAKE_JBOSS_STANDALONE_XML_FILE" "${3:-}"
+    exit 0
+  fi
+  exit 1
+fi
+
+if [ "${1:-}" = "rm" ] && [ "${2:-}" = "-f" ]; then
+  printf '%s\n' "${3:-}"
+  exit 0
+fi
+
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-app" ] && [ "${3:-}" = "8080/tcp" ]; then
+  printf '0.0.0.0:18080\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-cloudwatch-logs-mock" ] && [ "${3:-}" = "8080/tcp" ]; then
+  printf '0.0.0.0:18480\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-jaeger" ] && [ "${3:-}" = "16686/tcp" ]; then
+  printf '0.0.0.0:16686\n'
+  exit 0
+fi
+
+# OTel Collector の health_check 拡張ポート (ホストからの代替確認に使う)。
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-adot-collector" ] && [ "${3:-}" = "13133/tcp" ]; then
+  printf '0.0.0.0:13133\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "system" ] && [ "${2:-}" = "df" ]; then
+  if is_cleaned; then
+    printf 'Images|0 B\n'
+    printf 'Containers|0 B\n'
+    printf 'Local Volumes|0 B\n'
+    printf 'Build Cache|0 B\n'
+  else
+    printf 'Images|2 GB\n'
+    printf 'Containers|100 MB\n'
+    printf 'Local Volumes|500 MB\n'
+    printf 'Build Cache|400 MB\n'
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "system" ] && [ "${2:-}" = "prune" ]; then
+  if [ -n "${FAKE_DOCKER_CLEANED:-}" ]; then
+    : > "$FAKE_DOCKER_CLEANED"
+  fi
+  printf 'Total reclaimed space: 0B\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "info" ]; then
+  # ホスト側 df の値は環境依存になるため、Docker 管理対象容量だけをテストする。
+  exit 65
+fi
+
+if [ "${1:-}" = "container" ]; then
+  case "${2:-}" in
+    ls)
+      if ! is_cleaned; then
+        if [ "$*" = "container ls -q --filter status=paused" ]; then
+          printf 'cid-paused\n'
+        else
+          case "${3:-}" in
+            -q)  printf 'cid-running\ncid-paused\n' ;;
+            -aq) printf 'cid-running\ncid-paused\ncid-stopped\n' ;;
+            *) fail "$@" ;;
+          esac
+        fi
+      fi
+      ;;
+    unpause)
+      shift 2
+      printf '%s\n' "$@"
+      ;;
+    stop)
+      shift 2
+      printf '%s\n' "$@"
+      ;;
+    prune)
+      printf 'Total reclaimed space: 100MB\n'
+      ;;
+    *)
+      fail "$@"
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "builder" ] && [ "${2:-}" = "prune" ]; then
+  printf 'Total: 400MB\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ]; then
+  if ! is_cleaned; then
+    printf 'sha256:image-one\nsha256:image-two\n'
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "prune" ]; then
+  printf 'Total reclaimed space: 2GB\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  case "$*" in
+    *".Config.Env"*)
+      printf 'PATH=/usr/bin\n'
+      if [ -n "${FAKE_JBOSS_STANDALONE_XML_FILE:-}" ]; then
+        printf 'EAP_HOME=/opt/eap\n'
+      fi
+      ;;
+    *)
+      printf 'sha256:test-image|2026-07-18T00:00:00Z|12345\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "volume" ] && [ "${2:-}" = "ls" ]; then
+  if ! is_cleaned; then
+    printf 'volume-one\nvolume-two\n'
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "volume" ] && [ "${2:-}" = "prune" ]; then
+  printf 'Total reclaimed space: 500MB\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "network" ] && [ "${2:-}" = "ls" ]; then
+  if ! is_cleaned; then
+    printf 'network-one\n'
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "network" ] && [ "${2:-}" = "prune" ]; then
+  printf 'Deleted Networks:\nnetwork-one\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "inspect" ]; then
+  case "$*" in
+    *".Config.Healthcheck.Test"*)
+      case "$*" in
+        *"cid-nohealth"*) ;;
+        *"cid-adot-collector"*)
+          if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ]; then
+            # distroless イメージでよく使われる CMD-SHELL 形式の healthcheck。
+            printf 'CMD-SHELL\n'
+            printf 'wget -q -O- http://127.0.0.1:13133/ || exit 1\n'
+          else
+            printf 'CMD\n/healthcheck\n'
+          fi
+          ;;
+        *)
+          printf 'CMD-SHELL\n'
+          if [ "${FAKE_HEALTHCHECK_SECRET:-false}" = "true" ]; then
+            printf 'curl -u admin:super-secret -fs http://127.0.0.1:8080/health >/dev/null || exit 1\n'
+          else
+            printf 'curl -fs http://127.0.0.1:8080/health >/dev/null || exit 1\n'
+          fi
+          ;;
+      esac
+      ;;
+    *".Config.Healthcheck.Interval"*)
+      printf 'interval=30s\n'
+      printf 'timeout=5s\n'
+      printf 'retries=3\n'
+      printf 'start_period=2m0s\n'
+      ;;
+    *".State.Health.Status"*)
+      if [ "${FAKE_HEALTHCHECK_STATE_FAIL:-false}" = "true" ]; then
+        printf 'unhealthy|3\n'
+      else
+        printf 'healthy|0\n'
+      fi
+      ;;
+    *".State.Health.Log"*)
+      printf '開始: 2026-07-24T01:00:00.000000000Z\n'
+      printf '終了: 2026-07-24T01:00:00.050000000Z\n'
+      printf '終了コード: 0\n'
+      printf '出力:\n'
+      printf 'healthcheck request completed\n'
+      printf '────────────────────\n'
+      printf '開始: 2026-07-24T01:00:30.000000000Z\n'
+      printf '終了: 2026-07-24T01:00:30.040000000Z\n'
+      printf '終了コード: 0\n'
+      printf '出力:\n'
+      printf 'healthcheck request completed\n'
+      printf '────────────────────\n'
+      ;;
+    *".State.Status"*)
+      # サイドカーの異常終了をレポートへ残せるか確認できるよう、
+      # adot collector だけ終了済みとして扱う。
+      case "$*" in
+        *"cid-adot-collector"*) printf 'exited|1\n' ;;
+        *) printf 'running|0\n' ;;
+      esac
+      ;;
+    *".State.Running"*)
+      printf 'true\n'
+      ;;
+    *"com.docker.compose.service"*)
+      printf 'app\n'
+      ;;
+    *"{{.Name}}"*)
+      case "$*" in
+        *"cid-cwagent"*) printf '/cwagent\n' ;;
+        *"cid-cloudwatch-logs-mock"*) printf '/cloudwatch-logs-mock\n' ;;
+        *"cid-adot-collector"*) printf '/adot-collector\n' ;;
+        *"cid-jaeger"*) printf '/jaeger\n' ;;
+        *"cid-mysql80"*) printf '/mysql-8.0.42\n' ;;
+        *"cid-mysql84"*) printf '/aurora-mysql-8.4\n' ;;
+        *"cid-nohealth"*) printf '/no-healthcheck\n' ;;
+        *) printf '/test-app-1\n' ;;
+      esac
+      ;;
+    *".NetworkSettings.Networks"*)
+      printf '172.20.0.2\n'
+      ;;
+    *"{{.Image}}"*)
+      printf 'fake-image\n'
+      ;;
+    *".Config.Env"*)
+      printf 'PATH=/usr/bin\n'
+      ;;
+    *)
+      fail "$@"
+      ;;
+  esac
+  exit 0
+fi
+
+# distroless イメージの再現: シェルも wget も同梱されておらず、
+# /healthcheck バイナリも持たないコンテナとして振る舞う。
+if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ] \
+    && [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-adot-collector" ]; then
+  case "${3:-}" in
+    /bin/sh|/bin/bash|/bin/ash|/busybox/sh|/usr/bin/sh|/usr/bin/bash)
+      printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
+        "${3:-}" "${3:-}" >&2
+      exit 126
+      ;;
+    wget|/healthcheck)
+      printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": executable file not found in $PATH: unknown\n' \
+        "${3:-}" >&2
+      exit 127
+      ;;
+  esac
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${6:-}" = "healthcheck-http-probe" ]; then
+  if [ "${FAKE_HEALTHCHECK_HTTP_FAIL:-false}" = "true" ]; then
+    printf 'curl: (7) Failed to connect to 127.0.0.1 port 8080\n' >&2
+    exit 7
+  fi
+  printf 'HTTP/1.1 200 OK\r\n'
+  printf 'Content-Type: application/json\r\n'
+  printf 'Set-Cookie: session=response-cookie-secret; HttpOnly\r\n'
+  printf 'Content-Length: 47\r\n\r\n'
+  printf '{"status":"UP","token":"response-token-secret"}\n'
+  printf '\n[通信メトリクス]\n'
+  printf 'http_status=200\n'
+  printf 'remote=127.0.0.1:8080\n'
+  printf 'local=127.0.0.1:41000\n'
+  printf 'time_connect=0.001s\n'
+  printf 'time_starttransfer=0.002s\n'
+  printf 'time_total=0.003s\n'
+  printf 'size_download=15 bytes\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${6:-}" = "healthcheck-file" ]; then
+  printf 'ファイル: %s\n' "${7:-/healthcheck}"
+  printf '%s\n' '-rwxr-xr-x 1 root root 12345 Jul 24 00:00 /healthcheck'
+  printf '実行権限: あり\n'
+  printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /healthcheck\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-app" ] \
+    && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"curl -fs http://127.0.0.1:8080/health"* ]]; then
+  if [ "${FAKE_HEALTHCHECK_EXACT_FAIL:-false}" = "true" ]; then
+    exit 22
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [[ "${2:-}" == cid-mysql* ]] \
+    && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"command -v mysql"* ]]; then
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" != "-it" ] \
+    && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"command -v mysql"* ]]; then
+  exit 1
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "-it" ] \
+    && [[ "${3:-}" == cid-mysql* ]] && [ "${4:-}" = "/bin/sh" ] \
+    && [ "${5:-}" = "-c" ]; then
+  if [ "${FAKE_MYSQL_CLIENT_FAIL:-false}" = "true" ]; then
+    printf 'fake mysql client connection failed\n' >&2
+    exit 70
+  fi
+  case "${3:-}" in
+    cid-mysql80) printf 'Welcome to the MySQL monitor.  Server version: 8.0.42\n' ;;
+    cid-mysql84) printf 'Welcome to the MySQL monitor.  Server version: 8.4.6\n' ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-cwagent" ] \
+    && [ "${3:-}" = "cat" ] && [ "${4:-}" = "/etc/cwagentconfig/cwagent-config.json" ]; then
+  cat <<'JSON'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/mnt/logs/app-front*.log",
+            "log_group_name": "/local/myapp/efs/app-front",
+            "log_stream_name": "front-local"
+          },
+          {
+            "file_path": "/mnt/logs/app-back*.log",
+            "log_group_name": "/local/myapp/efs/app-back",
+            "log_stream_name": "back-local"
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-adot-collector" ] \
+    && [ "${3:-}" = "/healthcheck" ]; then
+  exit 0
+fi
+
+emit_fake_find_entry() {
+  local entry_path="$1" relative entry_depth=0 pruned_path
+  for pruned_path in "${fake_find_pruned_paths[@]}"; do
+    if [ "$entry_path" = "$pruned_path" ]; then
+      [ "$fake_find_type" = "d" ] || return 0
+      break
+    fi
+    if [[ "$entry_path" == "$pruned_path/"* ]]; then
+      return 0
+    fi
+  done
+  if [ "$fake_find_root" = "/" ]; then
+    relative="${entry_path#/}"
+  elif [ "$entry_path" = "$fake_find_root" ]; then
+    relative=""
+  elif [[ "$entry_path" == "$fake_find_root/"* ]]; then
+    relative="${entry_path#"$fake_find_root"/}"
+  else
+    return 0
+  fi
+  while [ -n "$relative" ]; do
+    entry_depth=$((entry_depth + 1))
+    case "$relative" in
+      */*) relative="${relative#*/}" ;;
+      *) relative="" ;;
+    esac
+  done
+  if [ "$fake_find_max_depth" = "all" ] || [ "$entry_depth" -le "$fake_find_max_depth" ]; then
+    printf '%s\0' "$entry_path"
+  fi
+}
+
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "find" ]; then
+  if [ "${FAKE_DOCKER_FIND_FAIL:-false}" = "true" ]; then
+    printf 'find: not found\n' >&2
+    exit 127
+  fi
+
+  fake_find_type=""
+  fake_find_max_depth="all"
+  fake_find_root="${4:-/}"
+  fake_find_next=""
+  fake_find_pruned_paths=()
+  for arg in "$@"; do
+    if [ "$fake_find_next" = "type" ]; then
+      fake_find_type="$arg"
+      fake_find_next=""
+      continue
+    fi
+    if [ "$fake_find_next" = "maxdepth" ]; then
+      fake_find_max_depth="$arg"
+      fake_find_next=""
+      continue
+    fi
+    if [ "$fake_find_next" = "path" ]; then
+      fake_find_pruned_paths+=("$arg")
+      fake_find_next=""
+      continue
+    fi
+    case "$arg" in
+      -type) fake_find_next="type" ;;
+      -maxdepth) fake_find_next="maxdepth" ;;
+      -path) fake_find_next="path" ;;
+    esac
+  done
+
+  case "$fake_find_type" in
+    d)
+      fake_find_entries=(
+        "/"
+        "/afs"
+        "/afs/cache"
+        "/app"
+        "/app/config"
+        "/app/config/nested"
+        "/aws"
+        "/aws/runtime"
+        "/empty"
+        "/etc"
+        "/etc/ssl"
+        "/local"
+        "/local/aws-cli"
+        "/local/aws-cli/aws-cli-hidden"
+        "/opt"
+        "/opt/app"
+        "/opt/app/config"
+        "/opt/eap"
+        "/opt/eap/standalone"
+        "/opt/eap/standalone/deployments"
+        "/opt/eap/standalone/deployments/orders.war"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes"
+        "/opt/jboss-eap"
+        "/opt/jboss-eap/.galleon"
+        "/opt/jboss-eap/.galleon/galleon-hidden"
+        "/opt/jboss-eap/modules"
+        "/opt/jboss-eap/modules/system"
+        "/opt/jboss-eap/modules/system/layers"
+        "/opt/jboss-eap/modules/system/layers/base"
+        "/opt/jboss-eap/modules/system/layers/base/jboss-base-hidden"
+        "/proc"
+        "/proc/1"
+        "/sys"
+        "/sys/kernel"
+        "/usr"
+        "/usr/lib"
+        "/usr/lib/jvm"
+        "/usr/lib64"
+        "/usr/lib64/lib64-hidden"
+        "/usr/local"
+        "/usr/local/usr-local-hidden"
+        "/usr/share"
+        "/usr/share/X11"
+        "/usr/share/X11/X11-hidden"
+        "/usr/share/doc"
+        "/usr/share/doc/doc-hidden"
+        "/usr/share/icons"
+        "/usr/share/icons/icons-hidden"
+        "/usr/share/licenses"
+        "/usr/share/licenses/licenses-hidden"
+        "/usr/share/man"
+        "/usr/share/man/man-hidden"
+        "/usr/share/osinfo"
+        "/usr/share/osinfo/osinfo-hidden"
+        "/usr/share/public"
+        "/usr/share/public/assets"
+        "/usr/share/zoneinfo"
+        "/usr/share/zoneinfo/zoneinfo-hidden"
+      )
+      ;;
+    f)
+      fake_find_entries=(
+        "/LICENSE"
+        "/afs/cache/index"
+        "/app/application.jar"
+        "/app/legacy.jar"
+        "/app/archive.tar.gz"
+        "/app/config/application.yaml"
+        "/app/config/override.yaml"
+        "/app/config/.env"
+        "/app/config/nested/deep.json"
+        "/aws/runtime/metadata.json"
+        "/etc/hosts"
+        "/local/aws-cli/aws-cli-hidden.txt"
+        "/opt/app/config/override.properties"
+        "/opt/app/config/runtime.properties"
+        "/opt/eap/standalone/deployments/orders.war.deployed"
+        "/opt/eap/standalone/deployments/orders.war/index.jsp"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/web.xml"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order01.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order02.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order03.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order04.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order05.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order06.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order07.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order08.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order09.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order10.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/Order11.class"
+        "/opt/eap/standalone/deployments/orders.war/WEB-INF/classes/application.properties"
+        "/opt/jboss-eap/.galleon/state"
+        "/opt/jboss-eap/modules/system/layers/base/jboss-base-hidden.xml"
+        "/proc/1/status"
+        "/sys/kernel/uevent_seqnum"
+        "/usr/lib/libexample.so"
+        "/usr/lib64/lib64-hidden.so"
+        "/usr/local/usr-local-hidden.txt"
+        "/usr/share/X11/X11-hidden.txt"
+        "/usr/share/doc/doc-hidden.txt"
+        "/usr/share/icons/icons-hidden.txt"
+        "/usr/share/licenses/licenses-hidden.txt"
+        "/usr/share/man/man-hidden.txt"
+        "/usr/share/osinfo/osinfo-hidden.txt"
+        "/usr/share/public/readme.txt"
+        "/usr/share/public/assets/logo.svg"
+        "/usr/share/zoneinfo/zoneinfo-hidden.txt"
+        "/usr/share/zoneinfo.txt"
+      )
+      ;;
+    *)
+      fail "$@"
+      ;;
+  esac
+  for fake_find_entry in "${fake_find_entries[@]}"; do
+    emit_fake_find_entry "$fake_find_entry"
+  done
+  exit 0
+fi
+
+# /proc/<pid>/cmdline の走査 (JVM パラメータ / OpenTelemetry 一覧の収集)。
+# 実際のスクリプトと同じく "PID<US>arg0<US>arg1..." 形式で返す。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"/proc/[0-9]"* ]]; then
+  if [ "${FAKE_DOCKER_NO_JAVA_PROCESS:-false}" = "true" ]; then
+    # JVM を実行しないコンテナ (Collector / DB など) の再現。
+    printf '1\037/usr/bin/otelcol\037--config=/etc/otel/config.yaml\037\n'
+    exit 0
+  fi
+  # JBoss EAP を OpenTelemetry Java エージェント付きで起動した状態の再現。
+  printf '1\037/opt/java/openjdk/bin/java'
+  printf '\037-D[Standalone]'
+  printf '\037-server'
+  printf '\037-Xms512m'
+  printf '\037-Xmx1024m'
+  printf '\037-XX:MetaspaceSize=96M'
+  printf '\037-XX:MaxMetaspaceSize=256m'
+  printf '\037-XX:+UseG1GC'
+  printf '\037-XX:MaxGCPauseMillis=200'
+  printf '\037-javaagent:/opt/otel/opentelemetry-javaagent.jar'
+  printf '\037-Dotel.service.name=orders-app'
+  printf '\037-Dotel.exporter.otlp.endpoint=http://adot-collector:4317'
+  printf '\037-Dotel.traces.exporter=otlp'
+  printf '\037-Djava.net.preferIPv4Stack=true'
+  printf '\037-Djboss.modules.system.pkgs=org.jboss.byteman'
+  printf '\037-Djboss.password=do-not-log-this-jvm-value'
+  printf '\037--add-opens=java.base/java.lang=ALL-UNNAMED'
+  printf '\037--add-exports\037java.base/sun.nio.ch=ALL-UNNAMED'
+  printf '\037-jar\037/opt/jboss-eap/jboss-modules.jar'
+  printf '\037-mp\037/opt/jboss-eap/modules'
+  printf '\037org.jboss.as.standalone'
+  printf '\037-Djboss.home.dir=/opt/jboss-eap'
+  printf '\037\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/opt/java/openjdk/bin/java" ] \
+    && [ "${4:-}" = "-version" ]; then
+  printf 'openjdk version "17.0.11" 2024-04-16 LTS\n' >&2
+  printf 'OpenJDK Runtime Environment (build 17.0.11+9-LTS)\n' >&2
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ]; then
+  printf 'APP_CONFIG_DIR=/opt/app/config\n'
+  printf 'API_TOKEN=do-not-log-this-value\n'
+  printf 'JAVA_TOOL_OPTIONS=-javaagent:/opt/otel/opentelemetry-javaagent.jar\n'
+  printf 'OTEL_EXPORTER_OTLP_ENDPOINT=http://adot-collector:4317\n'
+  printf 'OTEL_EXPORTER_OTLP_HEADERS=authorization=do-not-log-this-header\n'
+  printf 'OTEL_SERVICE_NAME=orders-app\n'
+  printf 'OTEL_TRACES_EXPORTER=otlp\n'
+  printf 'PATH=/usr/bin\n'
+  exit 0
+fi
+
+fail "$@"
