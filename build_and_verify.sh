@@ -116,9 +116,10 @@ JBOSS_PASSWORD_VALUE=""           # 直接指定されたマスターパスワ�
 JBOSS_PASSWORD_ENV="JBOSS_MASTER_PASSWORD"  # シークレット受け渡しに使う環境変数名
 JBOSS_PASSWORD_ENV_SET="false"    # --jboss-password-env が明示指定されたか
 JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシークレットとして注入するか
+JBOSS_PASSWORD_SHOW_VALUES="false" # true: 明示指定時だけ設定値・比較対象文字列を診断へ表示
 JBOSS_SECRET_ID="jboss_master_password"     # compose.yml / Dockerfile 間で使う既定の secret id
 JBOSS_PASSWORD_SOURCE="未設定"
-JBOSS_PASSWORD_EXPECTED=""        # 照合専用。値そのものは一切ログへ出力しない
+JBOSS_PASSWORD_EXPECTED=""        # 照合用。既定では非表示、明示指定時だけ診断へ表示
 JBOSS_PASSWORD_EXPECTED_FILE=""   # XML 照合用の権限 600 一時ファイル
 JBOSS_PASSWORD_REDACTION_FILE=""  # ビルドログマスク用の権限 600 一時ファイル
 JBOSS_PASSWORD_COMPOSE_STATUS="未確認"
@@ -472,6 +473,15 @@ JBoss マスターパスワード (BuildKit シークレット):
                            Dockerfile mount → standalone.xml の 5 段階を、
                            平文・ハッシュを出さずに自動照合する。
                            $ / # / ! / " / バッククォートは出現回数も記録する。
+  --show-jboss-password-values
+                           マスターパスワードの入力側設定値と standalone.xml 側の
+                           不一致・直接照合不能文字列を、表現種別 (平文候補 /
+                           ハッシュ形式候補 / 保護値等) と一緒にエスケープして
+                           診断へ表示する。
+                           指定しない場合も表現種別は表示するが、値は伏せる。
+                           ※ 秘密値が画面、--report-dir の全量レポート、および呼出元の
+                             --log-dir に残り得るため、隔離した調査時だけ使用すること。
+                             ビルドログ本文のマスクは、この指定時も解除しない。
   --region REGION          パラメータストア参照時の AWS リージョン
                            (既定: ap-northeast-1 / env: AWS_REGION)
 
@@ -637,6 +647,7 @@ while [ $# -gt 0 ]; do
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
     --jboss-password-env)   need_value "$1" $#; JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --show-jboss-password-values) JBOSS_PASSWORD_SHOW_VALUES="true"; shift ;;
     --verify-startup)      VERIFY_STARTUP="true"; shift ;;
     --startup-service)     need_value "$1" $#; append_services STARTUP_SERVICES "$2"; VERIFY_STARTUP="true"; shift 2 ;;
     --startup-log-pattern) need_value "$1" $#; STARTUP_LOG_PATTERN="$2"; shift 2 ;;
@@ -833,6 +844,10 @@ fi
 if [ -n "$JBOSS_PASSWORD_PARAM" ] || [ -n "$JBOSS_PASSWORD_VALUE" ] || [ "$JBOSS_PASSWORD_ENV_SET" = "true" ]; then
   JBOSS_SECRET_ENABLED="true"
 fi
+if [ "$JBOSS_PASSWORD_SHOW_VALUES" = "true" ] && [ "$JBOSS_SECRET_ENABLED" != "true" ]; then
+  err "--show-jboss-password-values は --jboss-password-param / --jboss-password / --jboss-password-env のいずれかと併用してください"
+  exit 2
+fi
 if ! printf '%s' "$JBOSS_PASSWORD_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
   err "--jboss-password-env に不正な環境変数名が指定されました: $JBOSS_PASSWORD_ENV"
   exit 2
@@ -902,9 +917,9 @@ if [ "$DRY_RUN" = "true" ]; then
   log "*** DRY-RUN モードです。実際のビルド/起動/URL 呼び出し/ファイル操作は行いません。 ***"
 fi
 
-# JBoss パスワード診断は平文やハッシュを保存せず、照合結果と文字種情報だけを
-# 画面および全量レポートへ残す。ハッシュも短いパスワードの推測材料になり得るため
-# 出力しない。
+# JBoss パスワード診断は既定で平文やハッシュ文字列を保存せず、照合結果・表現種別・
+# 文字種情報だけを画面および全量レポートへ残す。--show-jboss-password-values が
+# 明示された場合に限り、調査対象の値を一行エスケープ形式で診断へ含める。
 record_jboss_password_diagnostic() {
   local level="$1" message
   shift
@@ -930,6 +945,67 @@ count_jboss_password_character() {
   printf '%s' "$count"
 }
 
+# 文字列だけから平文かハッシュかを断定することはできないため、自己記述形式や
+# 代表的なダイジェスト長に一致する場合だけ「候補」として分類する。
+jboss_password_representation() {
+  local value="$1" digest_name=""
+  case "$value" in
+    MASK-*)
+      printf 'JBoss/WildFly MASK- 保護値（平文ではない）'
+      return 0
+      ;;
+    '${'*)
+      if [[ "$value" == *'}' ]]; then
+        printf '式参照（実値ではない）'
+        return 0
+      fi
+      ;;
+    '$2a$'*|'$2b$'*|'$2y$'*)
+      printf 'ハッシュ形式候補（bcrypt）'
+      return 0
+      ;;
+    '$argon2i$'*|'$argon2d$'*|'$argon2id$'*)
+      printf 'ハッシュ形式候補（Argon2）'
+      return 0
+      ;;
+    '$pbkdf2-'*|'$scrypt$'*)
+      printf 'ハッシュ形式候補（PBKDF2 / scrypt）'
+      return 0
+      ;;
+    '$1$'*)
+      printf 'ハッシュ形式候補（md5-crypt）'
+      return 0
+      ;;
+    '$5$'*)
+      printf 'ハッシュ形式候補（sha256-crypt）'
+      return 0
+      ;;
+    '$6$'*)
+      printf 'ハッシュ形式候補（sha512-crypt）'
+      return 0
+      ;;
+  esac
+  if [[ "$value" =~ ^\{([Ss][Hh][Aa]|[Ss][Ss][Hh][Aa]|[Mm][Dd]5|[Ss][Mm][Dd]5|[Pp][Bb][Kk][Dd][Ff]2)\} ]]; then
+    printf 'ハッシュ形式候補（LDAP 接頭辞形式）'
+    return 0
+  fi
+  if [[ "$value" =~ ^[[:xdigit:]]+$ ]]; then
+    case "${#value}" in
+      32)  digest_name="MD5 相当の32桁16進" ;;
+      40)  digest_name="SHA-1 相当の40桁16進" ;;
+      56)  digest_name="SHA-224 相当の56桁16進" ;;
+      64)  digest_name="SHA-256 相当の64桁16進" ;;
+      96)  digest_name="SHA-384 相当の96桁16進" ;;
+      128) digest_name="SHA-512 相当の128桁16進" ;;
+    esac
+  fi
+  if [ -n "$digest_name" ]; then
+    printf 'ハッシュ形式候補（%s）' "$digest_name"
+  else
+    printf '平文候補（既知のハッシュ・保護値形式には非該当）'
+  fi
+}
+
 jboss_password_profile() {
   local value="$1" byte_length character_length item joined=""
   local -a special_characters=()
@@ -948,7 +1024,8 @@ jboss_password_profile() {
       joined="${joined}${item}"
     done
   fi
-  printf '文字数=%s, UTF-8バイト数=%s, 対象特殊文字={%s}' \
+  printf '表現種別=%s, 文字数=%s, UTF-8バイト数=%s, 対象特殊文字={%s}' \
+    "$(jboss_password_representation "$value")" \
     "$character_length" "$byte_length" "$joined"
 }
 
@@ -1119,10 +1196,10 @@ execute_compose_build() {
 # 指定された場合に、マスターパスワードを取得して環境変数へ export する。
 # compose.yml 側で secrets の environment: に同じ環境変数名を定義しておくことで、
 # BuildKit シークレット (RUN --mount=type=secret) としてビルドから参照できる。
-# パスワードの値そのものは、ログにもコマンドラインにも出力しない。
+# 値は既定でログへ出さず、明示的な診断オプションがある場合だけ診断行へ出す。
 prepare_jboss_password() {
   [ "$JBOSS_SECRET_ENABLED" = "true" ] || return 0
-  local password="" exported_value
+  local password="" exported_value escaped_value
   if [ -n "$JBOSS_PASSWORD_PARAM" ]; then
     JBOSS_PASSWORD_SOURCE="SSM Parameter Store (${JBOSS_PASSWORD_PARAM})"
     log "パラメータストアから JBoss マスターパスワードを取得します: ${JBOSS_PASSWORD_PARAM} (region=${REGION}) ..."
@@ -1145,11 +1222,11 @@ prepare_jboss_password() {
         err "パラメータストアから取得した値が空です: ${JBOSS_PASSWORD_PARAM}"
         exit 1
       fi
-      log "パラメータストアから取得しました (値はログに出力しません)。"
+      log "パラメータストアから JBoss マスターパスワードを取得しました。"
     fi
   elif [ -n "$JBOSS_PASSWORD_VALUE" ]; then
     JBOSS_PASSWORD_SOURCE="直接指定 (--jboss-password)"
-    log "直接指定された JBoss マスターパスワードを使用します (値はログに出力しません)。"
+    log "直接指定された JBoss マスターパスワードを使用します。"
     password="$JBOSS_PASSWORD_VALUE"
   else
     JBOSS_PASSWORD_SOURCE="既存環境変数 (${JBOSS_PASSWORD_ENV})"
@@ -1168,7 +1245,14 @@ prepare_jboss_password() {
       exit 1
     fi
     record_jboss_password_diagnostic INFO \
-      "パスワード推移[1/5] 取得元=${JBOSS_PASSWORD_SOURCE}; $(jboss_password_profile "$JBOSS_PASSWORD_EXPECTED") (値・ハッシュは非表示)。"
+      "パスワード推移[1/5] 取得元=${JBOSS_PASSWORD_SOURCE}; $(jboss_password_profile "$JBOSS_PASSWORD_EXPECTED")。"
+    if [ "$JBOSS_PASSWORD_SHOW_VALUES" = "true" ]; then
+      printf -v escaped_value '%q' "$JBOSS_PASSWORD_EXPECTED"
+      record_jboss_password_diagnostic WARN \
+        "--show-jboss-password-values が有効です。秘密値が画面・全量レポート・呼出元ログへ残る可能性があります (ビルドログ本文は引き続きマスクします)。"
+      record_jboss_password_diagnostic DETAIL \
+        "パスワード推移[1/5] 入力側設定値: 取得元=${JBOSS_PASSWORD_SOURCE}; 表現種別=$(jboss_password_representation "$JBOSS_PASSWORD_EXPECTED"); 値(shell %q)=${escaped_value}"
+    fi
   else
     record_jboss_password_diagnostic INFO \
       "パスワード推移[1/5] DRY-RUN のため実値取得・文字列照合を行いません (取得元=${JBOSS_PASSWORD_SOURCE})。"
@@ -1375,7 +1459,7 @@ cleanup_jboss_password_diagnostics() {
 
 # 最終イメージを起動せず docker create/docker cp だけで standalone.xml を取得する。
 # ElementTree に XML エンティティを復元させた後、credential-store の clear-text と
-# 入力値をバイト単位で比較する。平文・可逆値・無塩ハッシュはいずれも出力しない。
+# 入力値をバイト単位で比較する。既定では値を出さず、明示指定時だけ不一致値を出す。
 verify_jboss_standalone_password() {
   local image="$1" python_command image_env home candidate found_path=""
   local xml_file parser_output parser_status parser_level parser_line old_umask create_status
@@ -1467,6 +1551,7 @@ verify_jboss_standalone_password() {
   fi
 
   "$python_command" - "$xml_file" "$JBOSS_PASSWORD_EXPECTED_FILE" "$JBOSS_PASSWORD_ENV" \
+      "$JBOSS_PASSWORD_SOURCE" "$JBOSS_PASSWORD_SHOW_VALUES" \
       >"$parser_output" 2>&1 <<'PY'
 import hmac
 import json
@@ -1474,13 +1559,45 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-xml_path, expected_path, expected_env = sys.argv[1:4]
+xml_path, expected_path, expected_env, expected_source, show_values_text = sys.argv[1:6]
+show_values = show_values_text == "true"
 
 def local_name(tag):
     return tag.rsplit("}", 1)[-1]
 
 def label(value):
     return json.dumps(str(value), ensure_ascii=False)
+
+def representation(value):
+    if value.startswith("MASK-"):
+        return "JBoss/WildFly MASK- 保護値（平文ではない）"
+    if value.startswith("${") and value.endswith("}"):
+        return "式参照（実値ではない）"
+    if re.match(r"^\$2[aby]\$", value):
+        return "ハッシュ形式候補（bcrypt）"
+    if re.match(r"^\$argon2(?:i|d|id)\$", value):
+        return "ハッシュ形式候補（Argon2）"
+    if re.match(r"^\$(?:pbkdf2-[^$]+|scrypt)\$", value):
+        return "ハッシュ形式候補（PBKDF2 / scrypt）"
+    if value.startswith("$1$"):
+        return "ハッシュ形式候補（md5-crypt）"
+    if value.startswith("$5$"):
+        return "ハッシュ形式候補（sha256-crypt）"
+    if value.startswith("$6$"):
+        return "ハッシュ形式候補（sha512-crypt）"
+    if re.match(r"^\{(?:S?SHA|S?MD5|PBKDF2)\}", value, re.IGNORECASE):
+        return "ハッシュ形式候補（LDAP 接頭辞形式）"
+    digest_names = {
+        32: "MD5 相当の32桁16進",
+        40: "SHA-1 相当の40桁16進",
+        56: "SHA-224 相当の56桁16進",
+        64: "SHA-256 相当の64桁16進",
+        96: "SHA-384 相当の96桁16進",
+        128: "SHA-512 相当の128桁16進",
+    }
+    if re.fullmatch(r"[0-9A-Fa-f]+", value) and len(value) in digest_names:
+        return f"ハッシュ形式候補（{digest_names[len(value)]}）"
+    return "平文候補（既知のハッシュ・保護値形式には非該当）"
 
 def profile(value):
     special = [
@@ -1496,7 +1613,8 @@ def profile(value):
         if character in value
     ) or "なし"
     return (
-        f"文字数={len(value)}, UTF-8バイト数={len(value.encode('utf-8'))}, "
+        f"表現種別={representation(value)}, 文字数={len(value)}, "
+        f"UTF-8バイト数={len(value.encode('utf-8'))}, "
         f"対象特殊文字={{{details}}}"
     )
 
@@ -1508,6 +1626,17 @@ except Exception as exc:
     print(f"XML解析エラー: {type(exc).__name__}: {exc}")
     raise SystemExit(23)
 
+try:
+    expected_text = expected.decode("utf-8")
+except UnicodeDecodeError:
+    expected_text = None
+
+expected_representation = (
+    representation(expected_text)
+    if expected_text is not None
+    else "非UTF-8バイト列（XMLのUTF-8文字列とは一致不能）"
+)
+
 stores = [element for element in root.iter() if local_name(element.tag) == "credential-store"]
 if not stores:
     print("Elytron credential-store 要素はありません。")
@@ -1516,6 +1645,7 @@ if not stores:
 literal_count = 0
 match_count = 0
 indirect_count = 0
+mismatches = []
 for store in stores:
     name = store.attrib.get("name", "(name なし)")
     path = store.attrib.get("path", "(path なし)")
@@ -1550,8 +1680,15 @@ for store in stores:
             print(
                 f"credential-store name={label(name)}, path={label(path)}: "
                 f"環境変数式参照 env={label(actual_env)} (入力経路={label(expected_env)}; "
-                f"変数名照合={relation})。実値は最終 XML だけでは直接照合不能"
+                f"変数名照合={relation})。実値は最終 XML だけでは直接照合不能; "
+                f"XML側 表現種別={representation(clear_text)}"
             )
+            if show_values:
+                print(
+                    f"standalone.xml側直接照合不能文字列: credential-store "
+                    f"name={label(name)}, path={label(path)}; "
+                    f"値(JSON)={label(clear_text)}"
+                )
             indirect_count += 1
             continue
         if clear_text.startswith("MASK-") or (
@@ -1559,8 +1696,15 @@ for store in stores:
         ):
             print(
                 f"credential-store name={label(name)}, path={label(path)}: "
-                "保護値または式参照のため直接照合不能"
+                "保護値または式参照のため直接照合不能; "
+                f"XML側 表現種別={representation(clear_text)}"
             )
+            if show_values:
+                print(
+                    f"standalone.xml側直接照合不能文字列: credential-store "
+                    f"name={label(name)}, path={label(path)}; "
+                    f"値(JSON)={label(clear_text)}"
+                )
             indirect_count += 1
             continue
 
@@ -1569,15 +1713,36 @@ for store in stores:
         matched = hmac.compare_digest(actual, expected)
         if matched:
             match_count += 1
+        else:
+            mismatches.append((name, path, clear_text))
         result = "完全一致" if matched else "不一致"
         print(
             f"credential-store name={label(name)}, path={label(path)}: "
-            f"literal clear-text の照合結果={result}; XML側 {profile(clear_text)}"
+            f"literal clear-text の照合結果={result}; "
+            f"入力側 表現種別={expected_representation}; XML側 {profile(clear_text)}"
+        )
+
+if show_values and mismatches:
+    print("--show-jboss-password-values による不一致実値比較（秘密情報）:")
+    if expected_text is None:
+        expected_display = f"値(hex)={expected.hex()}"
+    else:
+        expected_display = f"値(JSON)={label(expected_text)}"
+    print(
+        f"入力側設定値: 取得元={label(expected_source)}; "
+        f"表現種別={expected_representation}; {expected_display}"
+    )
+    for index, (name, path, clear_text) in enumerate(mismatches, start=1):
+        print(
+            f"standalone.xml側不一致文字列[{index}]: credential-store "
+            f"name={label(name)}, path={label(path)}; "
+            'XML属性="credential-reference@clear-text"; '
+            f"表現種別={representation(clear_text)}; 値(JSON)={label(clear_text)}"
         )
 
 print(
     f"credential-store 集計: stores={len(stores)}, literal={literal_count}, "
-    f"match={match_count}, indirect={indirect_count}"
+    f"match={match_count}, mismatch={len(mismatches)}, indirect={indirect_count}"
 )
 if match_count:
     raise SystemExit(0)
@@ -1588,6 +1753,9 @@ PY
   parser_status=$?
   while IFS= read -r parser_line; do
     case "$parser_status:$parser_line" in
+      *:*--show-jboss-password-values*|*:*入力側設定値:*|*:*standalone.xml側不一致文字列*|*:*standalone.xml側直接照合不能文字列*)
+        parser_level="DETAIL"
+        ;;
       20:*|23:*) parser_level="ERROR" ;;
       *:*照合結果=不一致*|*:*変数名照合=不一致*|*:*直接照合不能*)
         parser_level="WARN"
@@ -1596,7 +1764,13 @@ PY
       *) parser_level="WARN" ;;
     esac
     record_jboss_password_diagnostic "$parser_level" "  ${parser_line}"
-  done < <(redact_jboss_password_stream < "$parser_output")
+  done < <(
+    if [ "$JBOSS_PASSWORD_SHOW_VALUES" = "true" ]; then
+      cat "$parser_output"
+    else
+      redact_jboss_password_stream < "$parser_output"
+    fi
+  )
 
   case "$parser_status" in
     0)
@@ -1612,6 +1786,10 @@ PY
         "パスワード推移[5/5] standalone.xml 側の credential-store マスターパスワードと入力値が一致しません: ${found_path}"
       record_jboss_password_diagnostic ERROR \
         "不一致箇所は、推移[4/5]の BuildKit secret 以降から JBoss CLI の引用・エスケープを経て XML に保存されるまでの区間です。"
+      if [ "$JBOSS_PASSWORD_SHOW_VALUES" != "true" ]; then
+        record_jboss_password_diagnostic INFO \
+          "双方の実値が必要な場合は、出力を安全に管理できる隔離環境で --show-jboss-password-values を付けて再実行してください。"
+      fi
       cleanup_jboss_xml_temp_artifacts
       return 1
       ;;
@@ -1619,6 +1797,10 @@ PY
       JBOSS_PASSWORD_XML_STATUS="credential-reference が式/間接参照のため実値照合不能 (${found_path})"
       record_jboss_password_diagnostic WARN \
         "パスワード推移[5/5] standalone.xml は生成されていますが、credential-reference が式または間接参照のため実値を直接照合できません。"
+      if [ "$JBOSS_PASSWORD_SHOW_VALUES" != "true" ]; then
+        record_jboss_password_diagnostic INFO \
+          "XML に記録された文字列が必要な場合は、出力を安全に管理できる隔離環境で --show-jboss-password-values を付けて再実行してください。"
+      fi
       cleanup_jboss_xml_temp_artifacts
       return 0
       ;;
@@ -6556,7 +6738,12 @@ write_build_report() {
 
   if [ "$JBOSS_SECRET_ENABLED" = "true" ]; then
     {
-      printf '\n[1-A] JBoss マスターパスワード推移診断 (平文・ハッシュ非表示)\n'
+      if [ "$JBOSS_PASSWORD_SHOW_VALUES" = "true" ]; then
+        printf '\n[1-A] JBoss マスターパスワード推移診断 (秘密値表示あり: 明示指定)\n'
+        printf '注意            : 入力側設定値・不一致/直接照合不能文字列がこのレポートに含まれ得ます。\n'
+      else
+        printf '\n[1-A] JBoss マスターパスワード推移診断 (平文・ハッシュ非表示)\n'
+      fi
       printf '取得元          : %s\n' "$JBOSS_PASSWORD_SOURCE"
       printf 'Compose secret  : %s\n' "$JBOSS_PASSWORD_COMPOSE_STATUS"
       printf 'Dockerfile mount: %s\n' "$JBOSS_PASSWORD_DOCKERFILE_STATUS"

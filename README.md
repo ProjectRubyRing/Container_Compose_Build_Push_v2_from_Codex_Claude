@@ -122,6 +122,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
+| `--show-jboss-password-values` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。入力側設定値と `standalone.xml` 側の不一致・直接照合不能文字列を、推定した表現種別と一緒にエスケープ表示する。秘密値が画面・全量レポート・`--log-dir` のログへ残り得るため、隔離した調査時だけ明示指定する | `false` |
 | `--jboss-secret-id ID` | BuildKit シークレットの id (**buildx 版のみ**。compose 版は `compose.yml` の secrets 名で決まる) | `jboss_master_password` |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
 | `--auto-switchback` | ECR 権限が無い場合に自動でスイッチバックして継続する | `false` |
@@ -840,23 +841,34 @@ RUN --mount=type=secret,id=jboss_master_password \
    `credential-store/credential-reference`
 
 `$`、`#`、`!`、`"`、バッククォートについては、値を表示せず出現回数と
-文字数・UTF-8 バイト数を記録します。ビルド出力は逐次マスクしてから画面表示・
-一時保存し、失敗時に JBoss CLI / Elytron / credential-store のエラーだけを
-抜粋します。平文、可逆値、無塩ハッシュはログや全量レポートへ保存しません。
+文字数・UTF-8 バイト数を記録します。さらに入力値と XML 値を、既知形式に基づき
+「平文候補」「bcrypt / Argon2 / PBKDF2 / crypt / LDAP ハッシュ形式候補」
+「16 進ダイジェスト形式候補」「MASK 保護値」「式参照」へ分類します。文字列だけで
+平文かハッシュかを断定できないため、分類はあくまで候補です。
+
+既定では平文、可逆値、ハッシュ文字列をログや全量レポートへ保存しません。不一致の
+実値を確認する必要がある場合だけ `--show-jboss-password-values` を指定すると、
+入力側設定値を `[1/5]` で shell `%q` 形式にし、不一致比較欄では入力値と XML 値を
+JSON 文字列形式で一行表示します。この指定時は `--report-dir` の全量レポートや、呼出元
+`build_and_push.sh --build-only --log-dir` のログにも秘密値が残り得ます。ビルド出力
+本文については、指定の有無にかかわらず逐次マスクし、失敗時には JBoss CLI /
+Elytron / credential-store のエラーだけを抜粋します。
 
 最終イメージは起動せず、一時的な停止コンテナから標準的な `EAP_HOME` の
 `standalone/configuration/standalone.xml` をコピーします。Python 3 の XML
 パーサーで `&quot;` などを復元してから入力値と完全一致照合します。
 
 - literal `clear-text` が入力値と一致: 成功
-- literal `clear-text` がすべて不一致: 不一致区間を
-  「BuildKit secret → JBoss CLI → standalone.xml」としてエラー終了
+- literal `clear-text` がすべて不一致: 双方の表現種別と不一致区間を
+  「BuildKit secret → JBoss CLI → standalone.xml」として表示し、エラー終了。
+  `--show-jboss-password-values` 指定時は入力側設定値と XML 側不一致文字列も表示
 - 環境変数式、保護値、store/alias 間接参照: 設定方法を表示し、実値は
   「直接照合不能」と明示
 - `standalone.xml` が無い非 JBoss イメージ: 警告のみ
 - ビルド失敗ログが復号パスワード不一致を示す場合:
   「CLI/XML の設定値」と「既存 credential-store ファイルの暗号化パスワード」
-  の照合エラーであることを表示
+  の照合エラーであることを表示。暗号化時の元パスワードは credential-store から
+  取り出せないため、値表示を有効にしても入力側設定値だけが確認可能
 
 シェルによる先行展開を避けるため、特殊文字を含む値は単一引用符で export
 してください。改行 (LF/CR) を含む値は、安全な行単位マスクと CLI 境界を保証
@@ -865,6 +877,10 @@ RUN --mount=type=secret,id=jboss_master_password \
 ```bash
 export JBOSS_MASTER_PASSWORD='Special$#!"`Master'
 ./build_and_verify.sh --jboss-password-env JBOSS_MASTER_PASSWORD
+
+# 隔離した調査環境で、不一致時の双方の実値も確認する場合だけ追加
+./build_and_verify.sh --jboss-password-env JBOSS_MASTER_PASSWORD \
+    --show-jboss-password-values
 ```
 
 使用例:

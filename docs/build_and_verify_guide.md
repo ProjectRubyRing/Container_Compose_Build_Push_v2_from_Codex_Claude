@@ -294,13 +294,14 @@ compose down (削除)
 | `--jboss-password-param NAME` | SSM パラメータ名 | (なし) | パラメータストアから取得。**このとき AWS 認証が必要** |
 | `--jboss-password VALUE` | パスワード文字列 | (なし) | 直接指定。`--jboss-password-param` とは排他 |
 | `--jboss-password-env NAME` | 環境変数名 | `JBOSS_MASTER_PASSWORD` | 受け渡しに使う環境変数名。単独指定時は既存の環境変数値を使用 |
+| `--show-jboss-password-values` | フラグ | `false` | 入力側設定値と XML 側の不一致・直接照合不能文字列をエスケープ表示する。秘密値が出力へ残るため隔離した調査時だけ使用 |
 | `--region REGION` | AWS リージョン名 | `ap-northeast-1` (env `AWS_REGION`) | パラメータストア参照時のリージョン |
 
 パスワード指定時は、以下の推移診断も自動で有効になります。
 
 | 段階 | 確認内容 | 判定 |
 | --- | --- | --- |
-| `[1/5]` 取得元 | SSM / 直接指定 / 既存環境変数 | 値を出さず、文字数・UTF-8 バイト数と `$` `#` `!` `"` `` ` `` の出現回数を記録 |
+| `[1/5]` 取得元 | SSM / 直接指定 / 既存環境変数 | 値を出さず、表現種別候補、文字数・UTF-8 バイト数と `$` `#` `!` `"` `` ` `` の出現回数を記録 |
 | `[2/5]` export | 取得値と `--jboss-password-env` の値 | バイト列の完全一致 |
 | `[3/5]` Compose | `secrets.jboss_master_password.environment` と `build.secrets.source` | 環境変数名・secret id の一致。異なる場合は双方の**設定名**を表示してビルド前に終了 |
 | `[4/5]` BuildKit | Dockerfile 有効行の secret mount/read | `id=jboss_master_password` または `/run/secrets/jboss_master_password` を静的確認 |
@@ -308,7 +309,24 @@ compose down (削除)
 
 ビルド出力はマスターパスワードの平文・シェル引用・CLI 引用・XML エスケープ形を
 逐次 `[REDACTED:JBOSS_MASTER_PASSWORD]` へ置換してから表示します。診断用の
-一時ログは権限 600 で作成し、終了時に削除します。値や無塩ハッシュは出力しません。
+一時ログは権限 600 で作成し、終了時に削除します。このビルドログのマスクは
+`--show-jboss-password-values` 指定時も解除しません。
+
+通常の診断では実値を出さず、入力側と XML 側を、既知形式に基づいて平文候補、
+bcrypt / Argon2 / PBKDF2 / crypt / LDAP ハッシュ形式候補、16 進ダイジェスト形式
+候補、MASK 保護値、式参照へ分類します。任意の平文が偶然これらの形式に一致する
+可能性もあるため、分類は推定であり、暗号学的な検証結果ではありません。
+
+`--show-jboss-password-values` を明示すると、入力側設定値は `[1/5]` で shell `%q`、
+不一致比較欄の入力値と XML 値、および直接照合不能文字列は JSON 文字列として
+一行にエスケープして表示します。
+この値は画面だけでなく `--report-dir` の全量レポートや、呼出元で指定した
+`--log-dir` のログへも残り得ます。共有端末や CI では指定せず、出力ファイルの権限と
+削除を管理できる隔離した調査環境でだけ使用してください。
+
+ビルドが credential-store の復号エラーで最終イメージ生成前に失敗した場合、表示
+できるのは入力側設定値だけです。既存 credential-store を暗号化した元パスワードは
+ファイルから取り出せないため、比較相手の実値として表示することはできません。
 
 最終イメージの `EAP_HOME` / `JBOSS_HOME` と標準パス
 (`/opt/eap`、`/opt/jboss-eap`、`/opt/jboss/wildfly`、`/opt/wildfly`) を調べ、
@@ -323,6 +341,10 @@ LF/CR を含む値は安全な行単位マスクができないため使用で�
 ```bash
 export JBOSS_MASTER_PASSWORD='Special$#!"`Master'
 ./build_and_verify.sh --jboss-password-env JBOSS_MASTER_PASSWORD
+
+# 不一致時の双方の実値を確認する必要がある場合だけ明示
+./build_and_verify.sh --jboss-password-env JBOSS_MASTER_PASSWORD \
+  --show-jboss-password-values
 ```
 
 ### 4.3 起動確認 (JBoss EAP / WildFly)
@@ -826,7 +848,7 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
 | `--url-body-json と --url-body-form は同時に指定できません` | ボディの二重指定 | どちらか一方にする |
 | `ローカルベースイメージが見つかりません` | `compose.yml` の `image:` と `--local-image` が不一致 | 両者を一致させる |
 | `環境変数名が不一致です` | `--jboss-password-env` と Compose secret の `environment` が異なる | 表示された 2 つの設定名を一致させる |
-| `standalone.xml 側の credential-store マスターパスワードと入力値が一致しません` | BuildKit secret の読取り、JBoss CLI の引用・エスケープ、または XML 生成までに値が変化 | `[1-A]` の `[1/5]`〜`[5/5]` と credential-store 名を確認 |
+| `standalone.xml 側の credential-store マスターパスワードと入力値が一致しません` | BuildKit secret の読取り、JBoss CLI の引用・エスケープ、平文とハッシュ文字列の取り違え、または XML 生成までに値が変化 | `[1-A]` の `[1/5]`〜`[5/5]`、双方の表現種別、credential-store 名を確認。隔離した調査環境で実値が必要な場合だけ `--show-jboss-password-values` を付けて再実行 |
 | `ビルド失敗は JBoss マスターパスワード...に関連している可能性が高い` | JBoss CLI / Elytron / credential-store の復号・引用エラーを検出 | マスク済み抜粋の「エラーが示す照合点」を確認。既存 credential-store を再利用する場合は、その暗号化時パスワードとの一致も確認 |
 | `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 | 表示された失敗行と起動ログを確認 |
 | `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | `dependency failed to start` の対象サービスと、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |

@@ -617,6 +617,7 @@ assert_occurrences "${build_failure_reports[0]}" "(このサービスのログ�
 # $ / # / ! / 二重引用符 / バッククォートを含む値が、取得元から Compose secret、
 # XML エンティティ復元後の standalone.xml まで同一であり、平文はログへ残らない。
 special_password='Special$#!"`Master'
+hash_like_password='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 jboss_password_success_output="$TEST_TMP/jboss-password-success.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_DOCKER_BUILD_ECHO_JBOSS_PASSWORD="true"
@@ -650,8 +651,8 @@ assert_contains "${jboss_password_success_reports[0]}" "[1-A] JBoss マスター
 assert_contains "${jboss_password_success_reports[0]}" "standalone.xml の literal clear-text と完全一致"
 assert_not_contains "${jboss_password_success_reports[0]}" "$special_password"
 
-# XML へ生成された literal clear-text だけが異なる場合は、BuildKit secret 以降から
-# JBoss CLI の引用・エスケープまでを不一致区間として特定し、成功扱いにしない。
+# XML へ SHA-256 形式候補の文字列が生成され、平文候補の入力値と異なる場合は、
+# 値を伏せたまま双方の表現種別と不一致区間を特定し、成功扱いにしない。
 jboss_password_mismatch_output="$TEST_TMP/jboss-password-mismatch.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_JBOSS_STANDALONE_XML_FILE="$TEST_DIR/fixtures/standalone-jboss-password-mismatch.xml"
@@ -666,10 +667,62 @@ fi
 unset FAKE_JBOSS_STANDALONE_XML_FILE
 
 assert_not_contains "$jboss_password_mismatch_output" "$special_password"
-assert_not_contains "$jboss_password_mismatch_output" 'Special$#!"`MasteX'
+assert_not_contains "$jboss_password_mismatch_output" "$hash_like_password"
 assert_contains "$jboss_password_mismatch_output" "literal clear-text の照合結果=不一致"
+assert_contains "$jboss_password_mismatch_output" "入力側 表現種別=平文候補（既知のハッシュ・保護値形式には非該当）"
+assert_contains "$jboss_password_mismatch_output" "XML側 表現種別=ハッシュ形式候補（SHA-256 相当の64桁16進）"
+assert_contains "$jboss_password_mismatch_output" "match=0, mismatch=1"
 assert_contains "$jboss_password_mismatch_output" "standalone.xml 側の credential-store マスターパスワードと入力値が一致しません"
 assert_contains "$jboss_password_mismatch_output" "BuildKit secret 以降から JBoss CLI の引用・エスケープを経て XML に保存されるまでの区間"
+assert_contains "$jboss_password_mismatch_output" "--show-jboss-password-values を付けて再実行してください"
+
+# 明示指定時だけ、入力側設定値と XML 側不一致文字列を表現種別付きで確認できる。
+# ビルドログ本文については、この指定時も従来どおり入力値をマスクする。
+jboss_password_values_output="$TEST_TMP/jboss-password-values.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_DOCKER_BUILD_ECHO_JBOSS_PASSWORD="true"
+export FAKE_JBOSS_STANDALONE_XML_FILE="$TEST_DIR/fixtures/standalone-jboss-password-mismatch.xml"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --jboss-password "$special_password" \
+    --show-jboss-password-values \
+    --report-dir "$TEST_TMP/jboss-password-values-reports"
+) >"$jboss_password_values_output" 2>&1; then
+  unset FAKE_DOCKER_BUILD_ECHO_JBOSS_PASSWORD FAKE_JBOSS_STANDALONE_XML_FILE
+  cat "$jboss_password_values_output" >&2
+  fail "revealed standalone.xml password mismatch unexpectedly returned zero"
+fi
+unset FAKE_DOCKER_BUILD_ECHO_JBOSS_PASSWORD FAKE_JBOSS_STANDALONE_XML_FILE
+
+assert_contains "$jboss_password_values_output" "--show-jboss-password-values が有効です"
+assert_contains "$jboss_password_values_output" "fake JBoss CLI input: [REDACTED:JBOSS_MASTER_PASSWORD]"
+assert_not_contains "$jboss_password_values_output" "fake JBoss CLI input: $special_password"
+assert_contains "$jboss_password_values_output" "--show-jboss-password-values による不一致実値比較（秘密情報）"
+assert_contains "$jboss_password_values_output" "standalone.xml側不一致文字列[1]"
+printf -v special_password_shell_escaped '%q' "$special_password"
+assert_contains "$jboss_password_values_output" "入力側設定値: 取得元="
+assert_contains "$jboss_password_values_output" "値(shell %q)=$special_password_shell_escaped"
+jboss_password_values_reports=("$TEST_TMP/jboss-password-values-reports"/build_and_verify_*.txt)
+if [ ${#jboss_password_values_reports[@]} -ne 1 ] \
+    || [ ! -f "${jboss_password_values_reports[0]}" ]; then
+  fail "expected one report for revealed JBoss password diagnostics"
+fi
+assert_contains "${jboss_password_values_reports[0]}" "[1-A] JBoss マスターパスワード推移診断 (秘密値表示あり: 明示指定)"
+assert_contains "${jboss_password_values_reports[0]}" "値(shell %q)=$special_password_shell_escaped"
+assert_contains "${jboss_password_values_reports[0]}" "$hash_like_password"
+assert_contains "$jboss_password_values_output" "$hash_like_password"
+
+# 値表示オプションだけを単独指定しても、表示対象がないため引数エラーにする。
+jboss_password_values_without_source_output="$TEST_TMP/jboss-password-values-without-source.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --show-jboss-password-values
+) >"$jboss_password_values_without_source_output" 2>&1; then
+  cat "$jboss_password_values_without_source_output" >&2
+  fail "--show-jboss-password-values without a password source unexpectedly returned zero"
+fi
+assert_contains "$jboss_password_values_without_source_output" "--show-jboss-password-values は --jboss-password-param / --jboss-password / --jboss-password-env のいずれかと併用してください"
 
 # Compose の environment が --jboss-password-env と異なる場合はビルド前に止め、
 # どちらの設定名を照合して不一致になったかを明示する。
